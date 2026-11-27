@@ -139,6 +139,11 @@ const PROXIES = [
     build: (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
     unwrap: (text) => text,
   },
+  {
+    name: 'cors.lol',
+    build: (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
+    unwrap: (text) => text,
+  },
 ];
 
 let proxyIndex = 0;
@@ -189,10 +194,40 @@ async function fetchText(url, timeoutMs = 15000, rounds = 2) {
   return null;
 }
 
-async function fetchPostMeta(id) {
-  const text = await fetchText(`${SITE}/api/v2/post/${id}`, 12000, 2);
-  const data = parseJsonLoose(text || '');
-  return data && Number(data.id) === id ? data : null;
+/* メタデータ取得: 全プロキシ+直接を同時に走らせ、最初に正しいJSONを返したものを採用する。
+   順番に試すと失敗プロキシの待ち時間(各10秒超)が積み上がるため、レース方式にする */
+function fetchPostMeta(id, timeoutMs = 12000) {
+  const url = `${SITE}/api/v2/post/${id}`;
+  return new Promise((resolve) => {
+    let pending = PROXIES.length + 1;
+    let finished = false;
+    const controllers = [];
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+      controllers.forEach((c) => { try { c.abort(); } catch (_) {} });
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const tryOne = async (build, unwrap) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      try {
+        const r = await fetch(build(url), { signal: controller.signal });
+        if (!r.ok) throw new Error('bad status');
+        const raw = await r.text();
+        if (!raw || raw.startsWith('error code:')) throw new Error('bad body');
+        const data = parseJsonLoose(unwrap ? unwrap(raw) : raw);
+        if (data && Number(data.id) === id) { clearTimeout(timer); finish(data); return; }
+        throw new Error('not meta');
+      } catch (_) {
+        pending--;
+        if (pending <= 0) { clearTimeout(timer); finish(null); }
+      }
+    };
+    tryOne((u) => u, null); // 直接 (CORSで弾かれることが多いが、通る環境では最速)
+    PROXIES.forEach((p) => tryOne(p.build, p.unwrap));
+  });
 }
 
 /* 上限ID: プロキシ経由の一覧取得は遅くて全体が止まることがあるため、
@@ -250,22 +285,26 @@ function matchesFilters(post, f) {
 }
 
 async function pickWork(filters, onProgress) {
-  const upperBound = await getUpperBound();
+  const upperBound = getUpperBound();
   let attempts = 0, metaCalls = 0;
+  const BATCH = 6; // サムネイル存在確認はCDN直通で速いので、まとめて並行に引く
   for (;;) {
     if (attempts >= MAX_PROBE_ATTEMPTS || metaCalls >= MAX_META_CALLS) {
       throw new Error(`試行上限に達しました (${attempts}回抽選 / ${metaCalls}回検索)。条件を緩めるか、しばらく待ってからもう一度お試しください`);
     }
-    attempts++;
-    const id = 1 + Math.floor(Math.random() * upperBound);
+    const ids = Array.from({ length: BATCH }, () => 1 + Math.floor(Math.random() * upperBound));
+    attempts += ids.length;
     onProgress(attempts, metaCalls, upperBound);
-    if (attempts > 1) await sleep(120);
-    if (!(await probeByImage(id))) continue; // 存在しない/削除済み
-    metaCalls++;
-    const post = await fetchPostMeta(id);
-    if (!post) continue; // メタデータが取れない作品は判定できないので除外
-    if (!matchesFilters(post, filters)) continue;
-    return { post, attempts, url: `${SITE}/post/${id}`, thumb: thumbUrl(id) };
+    const probes = await Promise.all(ids.map((id) => probeByImage(id)));
+    const hits = ids.filter((_, i) => probes[i]);
+    for (const id of hits) {
+      metaCalls++;
+      onProgress(attempts, metaCalls, upperBound);
+      const post = await fetchPostMeta(id);
+      if (!post) continue; // メタデータが取れない作品は判定できないので除外
+      if (!matchesFilters(post, filters)) continue;
+      return { post, attempts, url: `${SITE}/post/${id}`, thumb: thumbUrl(id) };
+    }
   }
 }
 
@@ -316,8 +355,10 @@ button.addEventListener('click', async () => {
       includeTags: parseTagList($('#includeTags').value),
       excludeTags: parseTagList($('#excludeTags').value),
     };
+    const startedAt = Date.now();
     const work = await pickWork(filters, (a, m, bound) => {
-      status.textContent = `作品を探しています… ${a} 回目の抽選 (上限 ${bound} / 検索 ${m} 回)`;
+      const sec = Math.floor((Date.now() - startedAt) / 1000);
+      status.textContent = `作品を探しています… ${a} 回目の抽選 (上限 ${bound} / 検索 ${m} 回 / ${sec}秒)`;
     });
     const p = work.post;
     status.textContent = `作品 ID ${p.id} を見つけました (${work.attempts} 回目の抽選)。`;
