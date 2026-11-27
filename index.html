@@ -163,13 +163,13 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 }
 
 /* 直接 → プロキシ順でテキストを取る。失敗したら null */
-async function fetchText(url, timeoutMs = 15000) {
+async function fetchText(url, timeoutMs = 15000, rounds = 2) {
   try {
     const r = await fetchWithTimeout(url, {}, timeoutMs);
     if (r.ok) { const t = await r.text(); if (t) return t; }
   } catch (_) { /* CORS等で失敗したらプロキシへ */ }
-  /* 公開プロキシは混雑で 522/空応答になることがあるため、順に試して1周リトライする */
-  for (let round = 0; round < 2; round++) {
+  /* 公開プロキシは混雑で 522/空応答になることがあるため、順に試してリトライする */
+  for (let round = 0; round < rounds; round++) {
     for (let i = 0; i < PROXIES.length; i++) {
       const proxy = PROXIES[(proxyIndex + i) % PROXIES.length];
       try {
@@ -190,25 +190,34 @@ async function fetchText(url, timeoutMs = 15000) {
 }
 
 async function fetchPostMeta(id) {
-  const text = await fetchText(`${SITE}/api/v2/post/${id}`);
+  const text = await fetchText(`${SITE}/api/v2/post/${id}`, 12000, 2);
   const data = parseJsonLoose(text || '');
   return data && Number(data.id) === id ? data : null;
 }
 
-/* 上限ID: 新着一覧ページの先頭ID。取れなければ前回値/既定値 */
-async function getUpperBound() {
-  const html = await fetchText(`${SITE}/posts`);
-  if (html) {
+/* 上限ID: プロキシ経由の一覧取得は遅くて全体が止まることがあるため、
+   抽選は前回値/既定値で即開始し、最新化は裏で試みて次回に回す */
+function getUpperBound() {
+  let cached = null;
+  try { cached = Number(localStorage.getItem('r34random:upperBound')) || null; } catch (_) {}
+  refreshUpperBound();
+  return cached || DEFAULT_UPPER_BOUND;
+}
+
+let refreshingBound = false;
+async function refreshUpperBound() {
+  if (refreshingBound) return;
+  refreshingBound = true;
+  try {
+    const html = await fetchText(`${SITE}/posts`, 10000, 1);
+    if (!html) return;
     const ids = [...html.matchAll(/\/post\/(\d+)/g)].map((m) => Number(m[1])).filter(Boolean);
     if (ids.length) {
       const bound = Math.max(...ids.slice(0, 20));
       try { localStorage.setItem('r34random:upperBound', String(bound)); } catch (_) {}
-      return bound;
     }
-  }
-  let cached = null;
-  try { cached = Number(localStorage.getItem('r34random:upperBound')) || null; } catch (_) {}
-  return cached || DEFAULT_UPPER_BOUND;
+  } catch (_) { /* 取れなければ既定値のまま */ }
+  finally { refreshingBound = false; }
 }
 
 function thumbUrl(id) {
@@ -299,7 +308,7 @@ $('#copyLink').addEventListener('click', async () => {
 button.addEventListener('click', async () => {
   button.disabled = true;
   resultBox.hidden = true;
-  status.textContent = '上限IDを確認しています…';
+  status.textContent = '作品を探しています…';
   try {
     const filters = {
       mediaType: $('#mediaType').value,
